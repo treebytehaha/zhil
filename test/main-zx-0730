@@ -1,0 +1,409 @@
+import os
+import uuid
+import shutil
+from typing import Any, List, Optional, Dict
+import json
+from typing import Tuple
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+import uvicorn
+from pydantic import BaseModel, Field, ValidationError
+from langchain.llms.base import LLM
+from langchain.agents import Tool, initialize_agent, AgentType
+from langchain.agents.structured_chat.output_parser import (
+    StructuredChatOutputParserWithRetries,
+)
+from langchain.tools import StructuredTool
+from tools.tools import (
+    count_period_variable_occurrences,
+    count_period_variable_wrapped,
+    compare_period_variable_counts,
+    compare_variable_counts_wrapped,
+    top_k_variables_in_period,
+    top_k_variables_wrapped
+)
+# ========================
+# 自定义 DashScope LLM
+class DashScopeLLM(LLM):
+    model: str = "qwen-max"
+    dashscope_api_key: str
+
+    class Config:
+        extra = "allow"
+
+    @property
+    def _llm_type(self) -> str:
+        return "dashscope_custom"
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        import dashscope
+        from dashscope import Generation
+        dashscope.api_key = self.dashscope_api_key
+
+        messages = [
+            {"role": "system", "content": "你是一个专业的excel数据分析助手"},
+            {"role": "user", "content": prompt}
+        ]
+        resp = Generation.call(model=self.model, messages=messages)
+        return resp["output"]["text"]
+
+# ========================
+# 读表工具函数
+import re
+import pandas as pd
+from typing import Any
+
+
+
+def error_tool(args: dict) -> str:
+    return f"错误：{args.get('message', '未知错误')}"
+class CountArgs(BaseModel):
+    file_path: str = Field(..., description="Excel 文件绝对路径")
+    sheet_name: Any = Field(0, description="工作表索引或名称")
+    date_column: str = Field(..., description="日期列列名，例如 '年月'")
+    period: str = Field(..., pattern=r"^\d{4}-\d{1,2}$", description="YYYY-M 或 YYYY-MM")
+    column: str = Field(..., description="要统计的列名")
+    variable: Any = Field(..., description="要统计的取值")
+
+
+
+class CompareArgs(BaseModel):
+    file_path: str
+    sheet_name: Any = 0
+    date_column: str
+    column: str
+    variable: Any
+    period1: str = Field(..., pattern=r"^\d{4}-\d{1,2}$")
+    period2: str = Field(..., pattern=r"^\d{4}-\d{1,2}$")
+
+
+class TopKArgs(BaseModel):
+    file_path: str
+    sheet_name: Any = 0
+    date_column: str
+    period: str = Field(..., pattern=r"^\d{4}-\d{1,2}$")
+    column: str
+    k: int = Field(..., ge=1, le=50)
+# ========================
+# 初始化 LLM & Agent
+api_key = os.getenv("DASHSCOPE_API_KEY", "sk-51341d6718514f128743252bc13b5651")
+llm = DashScopeLLM(dashscope_api_key=api_key)
+
+tools = [
+    StructuredTool.from_function(
+        func=count_period_variable_wrapped,
+        name="count_period_variable",
+        description="统计指定年月下某列中变量出现的次数。",
+        args_schema=CountArgs,         # 刚才写的 Pydantic
+        return_direct=False,            # 结果直接回给 Agent
+    ),
+    StructuredTool.from_function(
+        func=compare_variable_counts_wrapped,
+        name="compare_variable_counts",
+        description="比较两个不同年月下同一列同一变量出现次数的差值（period2 - period1）。",
+        args_schema=CompareArgs,
+        return_direct=False,
+    ),
+    StructuredTool.from_function(
+        func=top_k_variables_wrapped,
+        name="top_k_variables",
+        description="返回指定月份中出现次数最多的前 K 个取值及其计数。",
+        args_schema=TopKArgs,
+        return_direct=False,
+    ),
+]
+
+
+agent = initialize_agent(
+    tools=tools,
+    llm=llm,
+    agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+    max_iterations=3,
+    handle_parsing_errors=False,  # 开发期如出错直接抛
+    early_stopping_method="generate",
+    verbose=True,
+    output_parser=StructuredChatOutputParserWithRetries(),  # 避免 LLM 格式小错误
+)
+
+
+# ========================
+# FastAPI
+app = FastAPI(title="Data Chat Backend", version="0.2.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
+
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# 全局存储（内存）
+CURRENT_FILE_PATH: Optional[str] = None   # 兼容老接口
+# sessions[session_id] = {
+#   "messages": [ {"role":"user|assistant","content": "..."} ],
+#   "docs": { doc_id: {"filename": "...", "path": "...", "uploaded_at": float_timestamp} },
+#   "current_doc_id": Optional[str]
+# }
+sessions: Dict[str, Dict[str, Any]] = {}
+
+# ========================
+# Pydantic 模型
+class Command(BaseModel):
+    command: str
+
+class SessionResponse(BaseModel):
+    session_id: str
+
+class ChatMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+class AnalyzeInSession(BaseModel):
+    command: str
+    doc_id: Optional[str] = None    # 指定分析的文档；为空则自动选
+    sheet_name: Optional[Any] = 0   # 可选：Excel 的 sheet
+    date_column: Optional[str] = None  # 若需要用到日期列统计
+    # 其他可扩展参数...
+
+class SetCurrentDocReq(BaseModel):
+    doc_id: str
+
+# ========================
+# 旧接口（保留兼容）
+@app.post("/api/upload-excel")
+async def upload_excel(file: UploadFile = File(...)):
+    """
+    旧接口：上传一个 Excel，写到 CURRENT_FILE_PATH。
+    新前端已使用会话内上传接口；保留以兼容。
+    """
+    global CURRENT_FILE_PATH
+    save_path = os.path.join(UPLOAD_DIR, file.filename)
+    contents = await file.read()
+    with open(save_path, "wb") as f:
+        f.write(contents)
+    CURRENT_FILE_PATH = save_path
+    return {"status": "ok", "file_path": save_path}
+
+def _pick_latest_excel_global() -> Optional[str]:
+    latest_path, latest_ts = None, -1
+    for sess in sessions.values():
+        for v in sess["docs"].values():
+            p = v["path"].lower()
+            if p.endswith((".xlsx", ".xls")) and os.path.exists(v["path"]):
+                ts = v.get("uploaded_at", 0)
+                if ts > latest_ts:
+                    latest_ts = ts
+                    latest_path = v["path"]
+    return latest_path
+
+@app.post("/api/analyze")
+async def analyze(cmd: Command):
+    global CURRENT_FILE_PATH
+    file_path = CURRENT_FILE_PATH
+    if not file_path or not os.path.exists(file_path):
+        file_path = _pick_latest_excel_global()
+
+    if not file_path:
+        return {"result": "请先上传 Excel 文件"}
+
+    query = f"文件路径是 {file_path}，{cmd.command}"
+    try:
+        result = agent.run(query)
+    except Exception as e:
+        result = f"分析出错: {e}"
+    return {"result": result, "file_path": file_path}
+
+
+# ========================
+# 多会话接口
+@app.post("/api/chat/sessions", response_model=SessionResponse)
+async def create_session():
+    """
+    创建会话，返回 session_id
+    """
+    session_id = str(uuid.uuid4())
+    sessions[session_id] = {"messages": [], "docs": {}, "current_doc_id": None}
+    return {"session_id": session_id}
+
+@app.get("/api/chat/sessions")
+async def list_sessions():
+    """
+    列出所有会话
+    """
+    return {"sessions": list(sessions.keys())}
+
+@app.delete("/api/chat/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """
+    删除会话及其文件
+    """
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session_dir = os.path.join(UPLOAD_DIR, session_id)
+    if os.path.exists(session_dir):
+        shutil.rmtree(session_dir)
+    del sessions[session_id]
+    return {"status": "deleted"}
+
+# ========================
+# 消息接口
+@app.post("/api/chat/sessions/{session_id}/messages")
+async def post_message(session_id: str, msg: ChatMessage):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if msg.role not in ("user", "assistant"):
+        raise HTTPException(status_code=400, detail="role must be 'user' or 'assistant'")
+    entry = msg.dict()
+    sessions[session_id]["messages"].append(entry)
+    return {"message": entry}
+
+@app.get("/api/chat/sessions/{session_id}/messages")
+async def get_messages(session_id: str, offset: int = 0, limit: int = 50):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    msgs = sessions[session_id]["messages"]
+    return {"messages": msgs[offset: offset + limit]}
+
+# ========================
+# 文档接口
+@app.post("/api/chat/sessions/{session_id}/docs")
+async def upload_doc(session_id: str, file: UploadFile = File(...)):
+    """
+    上传文档（任何类型），并存入会话
+    """
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session_dir = os.path.join(UPLOAD_DIR, session_id)
+    os.makedirs(session_dir, exist_ok=True)
+
+    doc_id = str(uuid.uuid4())
+    save_path = os.path.join(session_dir, f"{doc_id}_{file.filename}")
+    contents = await file.read()
+    with open(save_path, "wb") as f:
+        f.write(contents)
+
+    sessions[session_id]["docs"][doc_id] = {
+        "filename": file.filename,
+        "path": save_path,
+        "uploaded_at": os.path.getmtime(save_path),
+    }
+    return {"doc_id": doc_id, "filename": file.filename}
+
+@app.get("/api/chat/sessions/{session_id}/docs")
+async def list_docs(session_id: str):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    docs = sessions[session_id]["docs"]
+    return {
+        "docs": [
+            {"doc_id": k, "filename": v["filename"], "uploaded_at": v.get("uploaded_at")}
+            for k, v in docs.items()
+        ]
+    }
+
+@app.get("/api/chat/sessions/{session_id}/docs/{doc_id}")
+async def get_doc(session_id: str, doc_id: str):
+    if session_id not in sessions or doc_id not in sessions[session_id]["docs"]:
+        raise HTTPException(status_code=404, detail="Doc not found")
+    doc = sessions[session_id]["docs"][doc_id]
+    return FileResponse(path=doc["path"], filename=doc["filename"])
+
+# 设置/获取当前分析文档
+@app.put("/api/chat/sessions/{session_id}/current-doc")
+async def set_current_doc(session_id: str, req: SetCurrentDocReq):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if req.doc_id not in sessions[session_id]["docs"]:
+        raise HTTPException(status_code=404, detail="Doc not found")
+    sessions[session_id]["current_doc_id"] = req.doc_id
+    return {"status": "ok", "current_doc_id": req.doc_id}
+
+@app.get("/api/chat/sessions/{session_id}/current-doc")
+async def get_current_doc(session_id: str):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"current_doc_id": sessions[session_id].get("current_doc_id")}
+
+# ========================
+# 会话内分析
+def _pick_excel_for_session(session_id: str) -> Optional[str]:
+    """
+    选择一个可分析的 Excel 文件路径：
+    1) 若会话设置了 current_doc_id，且对应文件为 .xlsx / .xls，则使用；
+    2) 否则选择该会话中最新上传且扩展名为 .xlsx/.xls 的文件；
+    3) 若没有，返回 None。
+    """
+    sess = sessions.get(session_id)
+    if not sess:
+        return None
+
+    # 优先 current_doc_id
+    cur_id = sess.get("current_doc_id")
+    if cur_id:
+        doc = sess["docs"].get(cur_id)
+        if doc:
+            path = doc["path"]
+            if path.lower().endswith((".xlsx", ".xls")) and os.path.exists(path):
+                return path
+
+    # 其次最新上传的 Excel
+    excel_docs = [
+        v for v in sess["docs"].values()
+        if v["path"].lower().endswith((".xlsx", ".xls")) and os.path.exists(v["path"])
+    ]
+    if not excel_docs:
+        return None
+    # 根据上传时间排序
+    excel_docs.sort(key=lambda d: d.get("uploaded_at", 0), reverse=True)
+    return excel_docs[0]["path"]
+
+@app.post("/api/chat/sessions/{session_id}/analyze")
+async def analyze_in_session(session_id: str, req: AnalyzeInSession):
+    """
+    在指定会话中执行分析。
+    - 优先使用 req.doc_id 对应文件；
+    - 否则自动选择该会话最新 Excel；
+    - 若会话里没有 Excel，回退到旧接口的 CURRENT_FILE_PATH（便于过渡）；
+    """
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # 选择文件路径
+    file_path: Optional[str] = None
+    if req.doc_id:
+        doc = sessions[session_id]["docs"].get(req.doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Doc not found")
+        file_path = doc["path"]
+    else:
+        file_path = _pick_excel_for_session(session_id)
+
+    # 仍未找到就回退到旧的 CURRENT_FILE_PATH
+    if not file_path:
+        if CURRENT_FILE_PATH and os.path.exists(CURRENT_FILE_PATH):
+            file_path = CURRENT_FILE_PATH
+        else:
+            raise HTTPException(status_code=400, detail="未找到可用的 Excel，请先上传。")
+
+    query = f"文件路径是 {file_path}，{req.command}"
+    try:
+        result = agent.run(query)
+    except Exception as e:
+        result = f"分析出错: {e}"
+
+    # 保存消息（用户 -> 助手）
+    sessions[session_id]["messages"].append({"role": "user", "content": req.command})
+    sessions[session_id]["messages"].append({"role": "assistant", "content": result})
+
+    return {"result": result, "file_path": file_path}
+
+# ========================
+# 启动
+if __name__ == "__main__":
+    # 为了避免 dashscope 未设置 API key 导致报错，这里给出提示
+    if api_key == "YOUR_API_KEY":
+        print("[WARN] DASHSCOPE_API_KEY 未设置，记得在环境变量中配置。")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
