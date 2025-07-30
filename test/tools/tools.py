@@ -1,8 +1,48 @@
 import json, re, os
 from typing import Any, List, Tuple
 import pandas as pd
-
+from pydantic import BaseModel, Field
 # ---------- 公共辅助 ----------
+
+def error_tool(args: dict) -> str:
+    return f"错误：{args.get('message', '未知错误')}"
+
+# ---------- 0) 参数模型 ----------
+class PeriodCountArgs(BaseModel):
+    file_path: str
+    sheet_name: Any = 0
+    date_column: str
+    period: str = Field(..., pattern=r"^\d{4}-\d{1,2}$")  # YYYY-MM
+
+
+class CountArgs(BaseModel):
+    file_path: str = Field(..., description="Excel 文件绝对路径")
+    sheet_name: Any = Field(0, description="工作表索引或名称")
+    date_column: str = Field(..., description="日期列列名，例如 '年月'")
+    period: str = Field(..., pattern=r"^\d{4}-\d{1,2}$", description="YYYY-M 或 YYYY-MM")
+    column: str = Field(..., description="要统计的列名")
+    variable: Any = Field(..., description="要统计的取值")
+
+
+
+class CompareArgs(BaseModel):
+    file_path: str
+    sheet_name: Any = 0
+    date_column: str
+    column: str
+    variable: Any
+    period1: str = Field(..., pattern=r"^\d{4}-\d{1,2}$")
+    period2: str = Field(..., pattern=r"^\d{4}-\d{1,2}$")
+
+
+class TopKArgs(BaseModel):
+    file_path: str
+    sheet_name: Any = 0
+    date_column: str
+    period: str = Field(..., pattern=r"^\d{4}-\d{1,2}$")
+    column: str
+    k: int = Field(..., ge=1, le=50)
+
 def _clean_month_str(s: str) -> str:
     """把 '2024年3月' / '2024-3月' / '2024/03' 等转成 '2024-03'。"""
     s = str(s)
@@ -125,6 +165,28 @@ def top_k_variables_wrapped(**kwargs) -> str:
         "rows": rows
     }
     return json.dumps(payload, ensure_ascii=False)
+
+
+
+# ---------- 4) 仅按时间统计 ----------
+def count_rows_in_period(
+    file_path: str,
+    sheet_name: Any,
+    date_column: str,
+    period: str,
+) -> Tuple[int, List[dict]]:
+    df_period = _load_and_filter(file_path, sheet_name, date_column, period)
+    return len(df_period), _df_rows_to_str_records(df_period)
+
+def count_rows_in_period_wrapped(**kwargs) -> str:
+    cnt, rows = count_rows_in_period(**kwargs)
+    payload = {
+        "period": kwargs["period"],
+        "count":  cnt,
+        "rows":   rows           # 截断逻辑同 _df_rows_to_str_records
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
 # def _clean_month_str(s: str) -> str:
 #     """
 #     将 '2024-2月' / '2024年3月' / '2024/03' 等格式统一成 '2024-02'
