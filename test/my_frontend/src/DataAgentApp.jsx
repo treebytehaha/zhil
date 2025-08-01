@@ -148,40 +148,38 @@ export default function DataAgentApp() {
     }
   }
 
+  /* ---------- 发送消息 & 调用分析 ---------- */
   async function sendMessage() {
-    if (!currentSession) {
-      setError("请先创建或选择会话");
-      return;
-    }
+    if (!currentSession) return setError("请先创建或选择会话");
     const text = input.trim();
     if (!text) return;
 
     setError("");
     setPending(true);
 
-    // 乐观更新：先把用户消息放到列表里
+    // 1) 本地先渲染用户消息
     const localUserMsg = { role: "user", content: text };
-    setMessages((prev) => [...prev, localUserMsg]); // 修正拼写
+    setMessages((prev) => [...prev, localUserMsg]);
     setInput("");
 
     try {
-      // 保存用户消息
-      await api.post(
-        `/api/chat/sessions/${currentSession}/messages`,
-        localUserMsg
+      await api.post(`/api/chat/sessions/${currentSession}/messages`, localUserMsg);
+
+      // 2) 调用会话内分析接口
+      const { data } = await api.post(
+        `/api/chat/sessions/${currentSession}/analyze`,
+        { command: text }
       );
 
-      // 调后端分析
-      const res = await api.post("/api/analyze", { command: text });
-      const assistantText = res.data?.result ?? "";
-
-      // 保存助手消息
-      await api.post(`/api/chat/sessions/${currentSession}/messages`, {
+      // 3) 写入助手消息（含 refs）
+      const assistantMsg = {
         role: "assistant",
-        content: assistantText,
-      });
+        content: data.result ?? "",
+        refs: data.refs || null,
+      };
+      await api.post(`/api/chat/sessions/${currentSession}/messages`, assistantMsg);
 
-      // 刷新消息
+      // 4) 刷新消息
       await loadMessages();
     } catch (e) {
       setError(e?.response?.data?.detail || e.message);
@@ -189,6 +187,7 @@ export default function DataAgentApp() {
       setPending(false);
     }
   }
+
 
   return (
     <div className="h-screen w-screen overflow-hidden flex">
@@ -279,15 +278,18 @@ export default function DataAgentApp() {
               这里将显示对话内容…
             </div>
           )}
+          
 
           <div className="max-w-3xl mx-auto space-y-6">
             {messages.map((m, idx) => (
-              <ChatBubble key={idx} role={m.role} content={m.content} />
+              console.log("666",m.refs), 
+              console.log("[render]",m.refs), 
+              <ChatBubble key={idx} role={m.role} content={m.content} refs={m.refs} />
             ))}
 
             {pending && (
               <div className="flex gap-2 items-center text-gray-500 text-sm">
-                <span className="animate-pulse">助手正在思考…</span>
+                <span className="animate-pulse">助手思考中…</span>
               </div>
             )}
 
@@ -464,17 +466,13 @@ export default function DataAgentApp() {
   );
 }
 
-function ChatBubble({ role, content }) {
+function ChatBubble({ role, content, refs }) {
+  console.log("bubble refs:", refs);
   const isUser = role === "user";
+
   return (
     <div className={`flex items-start gap-3 ${isUser ? "justify-end" : ""}`}>
-      {!isUser && (
-        <Avatar
-          fallback="AI"
-          className="bg-brand-600 text-white"
-          title="Assistant"
-        />
-      )}
+      {!isUser && <Avatar fallback="AI" className="bg-brand-600 text-white" />}
 
       <div
         className={`prose prose-sm max-w-none rounded-2xl px-4 py-3 border ${
@@ -484,18 +482,101 @@ function ChatBubble({ role, content }) {
         }`}
         style={{ overflowWrap: "anywhere" }}
       >
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-          {content || ""}
-        </ReactMarkdown>
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+
+        {/* 折叠 refs */}
+        {!isUser && Array.isArray(refs) && refs.length > 0 && (
+          <div className="mt-3 not-prose space-y-2">
+            {refs.map((r, i) => (
+              <details key={i} className="text-xs border rounded-md p-2">
+                <summary className="cursor-pointer select-none">
+                  参考结果 #{i + 1}{r.tool && ` · ${r.tool}`}
+                </summary>
+                <pre className="mt-2 whitespace-pre-wrap break-all text-[11px]">
+                  {JSON.stringify(r.payload, null, 2)}
+                </pre>
+              </details>
+            ))}
+          </div>
+        )}
       </div>
 
-      {isUser && (
-        <Avatar fallback="U" className="bg-gray-800 text-white" title="You" />
-      )}
+      {isUser && <Avatar fallback="U" className="bg-gray-800 text-white" />}
     </div>
   );
 }
 
+function RefSummary({ payload }) {
+  if (!payload || typeof payload !== "object") return null;
+
+  // 选择常见的字段做一个小表概要：period/column/variable/count/top_k/diff 等
+  const fields = ["period","column","variable","count","period1","count1","period2","count2","diff","top_k"];
+  const entries = fields
+    .filter((k) => k in payload)
+    .map((k) => [k, payload[k]]);
+
+  if (entries.length === 0) return null;
+
+  return (
+    <table className="mt-2 w-full border text-[11px]">
+      <tbody>
+        {entries.map(([k, v]) => (
+          <tr key={k} className="border-b last:border-0">
+            <td className="px-1 py-[2px] font-medium whitespace-nowrap">{k}</td>
+            <td className="px-2 py-[2px] break-all">
+              {typeof v === "object" ? JSON.stringify(v) : String(v)}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function RefRowsTable({ payload }) {
+  const rows = payload && Array.isArray(payload.rows) ? payload.rows : null;
+  if (!rows || rows.length === 0) return null;
+
+  // 取所有行键的并集作为列
+  const colSet = new Set();
+  rows.forEach((r) => Object.keys(r || {}).forEach((k) => colSet.add(k)));
+  const cols = Array.from(colSet);
+
+  const MAX_SHOW = 50; // 防止超大表撑爆
+  const view = rows.slice(0, MAX_SHOW);
+
+  return (
+    <div className="mt-2">
+      <div className="text-[11px] text-gray-500 mb-1">
+        共 {rows.length} 行{rows.length > MAX_SHOW ? `，已显示前 ${MAX_SHOW} 行` : ""}
+      </div>
+      <div className="overflow-x-auto border rounded-md">
+        <table className="w-full text-[11px]">
+          <thead>
+            <tr className="bg-gray-50">
+              {cols.map((c) => (
+                <th key={c} className="px-2 py-1 border-b text-left whitespace-nowrap">
+                  {c}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {view.map((r, i) => (
+              <tr key={i} className="border-b last:border-0">
+                {cols.map((c) => (
+                  <td key={c} className="px-2 py-1 align-top">
+                    {r && r[c] != null ? String(r[c]) : ""}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
 function Avatar({ fallback, className = "", title = "" }) {
   return (
     <div
