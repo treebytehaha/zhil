@@ -43,6 +43,75 @@ class TopKArgs(BaseModel):
     column: str
     k: int = Field(..., ge=1, le=50)
 
+class ColumnValuesArgs(BaseModel):
+    file_path: str
+    sheet_name: Any = 0
+    column: str                   # 目标列名
+
+
+class ColumnTopKArgs(BaseModel):
+    file_path: str
+    sheet_name: Any = 0
+    column: str
+    k: int = 10                   # 默认前 10 名
+
+def column_top_k(
+    file_path: str,
+    sheet_name: Any,
+    column: str,
+    k: int = 10,
+) -> List[Tuple[Any, int]]:
+    df = pd.read_excel(file_path, sheet_name=sheet_name)
+    vc = (
+        df[column]
+        .astype(str)                    # 统一转字符串
+        .str.strip()                    # 去首尾空格
+        .str.lower()                    # 不区分大小写
+        .value_counts(dropna=True)
+        .head(k)
+    )
+    return list(zip(vc.index.tolist(), vc.values.tolist()))
+
+def column_top_k_wrapped(**kwargs) -> str:
+    return json.dumps(
+        {"topk": column_top_k(**kwargs), **kwargs},
+        ensure_ascii=False,
+    )
+class ColumnValueCountArgs(BaseModel):
+    file_path: str
+    sheet_name: Any = 0
+    column: str
+    value: Any
+
+def count_column_value(
+    file_path: str,
+    sheet_name: Any,
+    column: str,
+    value: Any,
+) -> int:
+    df = pd.read_excel(file_path, sheet_name=sheet_name)
+    mask = df[column].astype(str).str.contains(str(value), case=False, na=False)
+    return int(mask.sum())
+
+def count_column_value_wrapped(**kwargs) -> str:
+    return json.dumps(
+        {"count": count_column_value(**kwargs), **kwargs},
+        ensure_ascii=False,
+    )
+
+
+def list_column_values(
+    file_path: str,
+    sheet_name: Any,
+    column: str,
+) -> List[Any]:
+    df = pd.read_excel(file_path, sheet_name=sheet_name)
+    return df[column].dropna().tolist()
+
+def list_column_values_wrapped(**kwargs) -> str:
+    values = list_column_values(**kwargs)
+    return json.dumps({"values": values, **kwargs}, ensure_ascii=False)
+
 def _clean_month_str(s: str) -> str:
     """把 '2024年3月' / '2024-3月' / '2024/03' 等转成 '2024-03'。"""
     s = str(s)
