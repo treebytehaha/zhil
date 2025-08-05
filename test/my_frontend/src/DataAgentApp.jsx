@@ -400,7 +400,10 @@ function ChatBubble({ role, content, refs }) {
             : "bg-white text-gray-800"
         }`} style={{ overflowWrap: "anywhere" }}>
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
-
+        {refs?.map?.((r, i) => {
+          const url = r.image_url || r.payload?.image_url;
+          return url ? <img key={i} src={url} className="mt-3 rounded-lg" /> : null;
+        })}
         {!isUser && Array.isArray(refs) && refs.length > 0 && (
           <div className="mt-3 not-prose space-y-2">
             {refs.map((r, i) => (
